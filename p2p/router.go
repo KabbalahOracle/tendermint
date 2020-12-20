@@ -62,7 +62,8 @@ func (r *Router) OpenChannel(id ChannelID, messageType proto.Message) (*Channel,
 		return nil, fmt.Errorf("channel %v already in use", id)
 	}
 
-	channel := NewChannel(id, messageType, make(chan Envelope), make(chan Envelope), nil) // FIXME: handle PeerError
+	// FIXME: handle PeerError
+	channel := NewChannel(id, messageType, make(chan Envelope), make(chan Envelope), make(chan PeerError))
 	r.channels[id] = channel
 	r.wgChannels.Add(1)
 	go func() {
@@ -140,7 +141,6 @@ func (r *Router) acceptPeers(transport Transport) {
 				r.mtx.Lock()
 				delete(r.peers, peer.ID.String())
 				r.mtx.Unlock()
-				close(ch)
 				_ = conn.Close()
 				r.store.Return(peer.ID)
 				r.wgPeers.Done()
@@ -285,18 +285,26 @@ func (r *Router) receivePeer(peer *sPeer, conn Connection) error {
 
 // sendPeer receives outbound messages from channels and sends them to the peer.
 func (r *Router) sendPeer(conn Connection, ch <-chan Envelope) {
-	for envelope := range ch {
-		bz, err := proto.Marshal(envelope.Message)
-		if err != nil {
-			r.logger.Error("failed to marshal message", "peer", envelope.To.String(), "err", err)
-			continue
-		}
+	for {
+		select {
+		case envelope := <-ch:
+			bz, err := proto.Marshal(envelope.Message)
+			if err != nil {
+				r.logger.Error("failed to marshal message", "peer", envelope.To.String(), "err", err)
+				continue
+			}
 
-		// FIXME: Should take ChannelID.
-		_, err = conn.SendMessage(byte(envelope.channel), bz)
-		if err != nil {
-			r.logger.Error("failed to send to peer", "peer", envelope.To.String(), "err", err)
-			continue
+			// FIXME: Should take ChannelID.
+			_, err = conn.SendMessage(byte(envelope.channel), bz)
+			if err == io.EOF {
+				return
+			} else if err != nil {
+				// FIXME May want to close connection here.
+				r.logger.Error("failed to send to peer", "peer", envelope.To.String(), "err", err)
+				continue
+			}
+		case <-r.chClose:
+			return
 		}
 	}
 }
@@ -320,7 +328,13 @@ func (r *Router) receiveChannel(channel *Channel) {
 			}
 
 			envelope.channel = channel.id
-			ch <- envelope
+			select {
+			case ch <- envelope:
+			case <-channel.doneCh:
+				return
+			case <-r.chClose:
+				return
+			}
 			r.logger.Debug("sent message", "peer", envelope.To, "message", envelope.Message)
 		case <-channel.doneCh:
 			return
