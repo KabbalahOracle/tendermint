@@ -1,30 +1,36 @@
 package p2p
 
-// scheduler does QoS scheduling for rawEnvelopes. It enqueues and dequeues
-// raw envelopes according to some policy.
+// scheduler does QoS scheduling for Envelopes, enqueueing and dequeueing
+// according to some policy. Schedulers are used at contention points, i.e.:
+//
+// - Receiving inbound messages for a single channel from all peers.
+// - Sending outbound messages to a single peer from all channels.
+//
+// As such, enqueue() is a blocking method call that is expected to be called
+// concurrently, and dequeue() returns a channel that is expected to be consumed
+// serially.
 type scheduler interface {
-	// enqueue returns a channel used to enqueue messages for scheduling.
-	enqueue() chan<- rawEnvelope
+	// enqueue enqueues a message envelope.
+	enqueue(Envelope)
 
-	// dequeue returns a channel for messages scheduled according to some
-	// policy.
-	dequeue() <-chan rawEnvelope
+	// dequeue returns an envelope channel ordered according to some policy.
+	dequeue() <-chan Envelope
 }
 
-// fifoScheduler is a simple scheduler that passes messages through in the
-// order they were received.
+// fifoScheduler is a simple lossless scheduler that passes messages through in
+// the order they were received. If the channel is full, enqueue() will block.
 type fifoScheduler struct {
-	ch chan rawEnvelope
+	ch chan Envelope
 }
 
-func newFIFOScheduler(bufSize int) *fifoScheduler {
-	return &fifoScheduler{ch: make(chan rawEnvelope, bufSize)}
+func newFIFOScheduler(ch chan Envelope) *fifoScheduler {
+	return &fifoScheduler{ch: ch}
 }
 
-func (s *fifoScheduler) dequeue() <-chan rawEnvelope {
+func (s *fifoScheduler) dequeue() <-chan Envelope {
 	return s.ch
 }
 
-func (s *fifoScheduler) enqueue() chan<- rawEnvelope {
-	return s.ch
+func (s *fifoScheduler) enqueue(envelope Envelope) {
+	s.ch <- envelope
 }
