@@ -309,9 +309,13 @@ func (s *peerStore) Claim(id PeerID) *sPeer {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	key := id.String()
-	peer, ok := s.peers[key]
-	if !ok || s.claimed[key] {
+	if s.claimed[key] {
 		return nil
+	}
+	peer, ok := s.peers[key]
+	if !ok {
+		peer = newSPeer(id)
+		s.peers[key] = peer
 	}
 	s.claimed[key] = true
 	return peer

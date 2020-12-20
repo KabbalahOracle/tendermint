@@ -1,53 +1,76 @@
 package p2p_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
+	gogotypes "github.com/gogo/protobuf/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/p2p"
 )
+
+type TestMessage = gogotypes.StringValue
+
+func echoReactor(channel *p2p.Channel) {
+	for {
+		select {
+		case envelope := <-channel.In():
+			channel.Out() <- p2p.Envelope{
+				To:      envelope.From,
+				Message: &TestMessage{Value: envelope.Message.(*TestMessage).Value},
+			}
+		case <-channel.Done():
+			return
+		}
+	}
+}
 
 func TestRouter(t *testing.T) {
 	logger := log.TestingLogger()
 	network := p2p.NewMemoryNetwork(logger)
 	transport := network.GenerateTransport()
-	a := network.GenerateTransport()
-	b := network.GenerateTransport()
-	c := network.GenerateTransport()
+	chID := p2p.ChannelID(1)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	peers := []p2p.PeerAddress{}
+	for i := 0; i < 3; i++ {
+		peerTransport := network.GenerateTransport()
+		peerRouter := p2p.NewRouter(logger.With("peerID", i), map[p2p.Protocol]p2p.Transport{
+			p2p.MemoryProtocol: peerTransport,
+		}, nil)
+		peers = append(peers, peerTransport.Endpoints()[0].PeerAddress())
 
-	runPeer := func(transport p2p.Transport) {
-		for {
-			conn, err := transport.Accept(ctx)
-			if err == context.Canceled {
-				return
-			}
-			require.NoError(t, err)
-			sent, err := conn.SendMessage(1, []byte("hi!"))
-			require.True(t, sent)
-			require.NoError(t, err)
-			conn.Close()
-		}
+		channel, err := peerRouter.OpenChannel(chID, &TestMessage{})
+		require.NoError(t, err)
+		defer channel.Close()
+		go echoReactor(channel)
+
+		err = peerRouter.Start()
+		require.NoError(t, err)
+		defer func() { require.NoError(t, peerRouter.Stop()) }()
 	}
-	go runPeer(a)
-	go runPeer(b)
-	go runPeer(c)
 
 	router := p2p.NewRouter(logger, map[p2p.Protocol]p2p.Transport{
 		p2p.MemoryProtocol: transport,
-	}, []p2p.PeerAddress{
-		a.Endpoints()[0].PeerAddress(),
-		b.Endpoints()[0].PeerAddress(),
-		c.Endpoints()[0].PeerAddress(),
-	})
-	err := router.Start()
+	}, peers)
+	channel, err := router.OpenChannel(chID, &TestMessage{})
+	require.NoError(t, err)
+
+	err = router.Start()
 	require.NoError(t, err)
 	defer func() { require.NoError(t, router.Stop()) }()
+
+	// FIXME: Should use peer updates to wait for peers to become available.
+	time.Sleep(time.Second)
+	for _, peer := range peers {
+		channel.Out() <- p2p.Envelope{To: peer.PeerID(), Message: &TestMessage{Value: "hi!"}}
+		assert.Equal(t, p2p.Envelope{
+			From:    peer.PeerID(),
+			Message: &TestMessage{Value: "hi!"},
+		}, <-channel.In())
+	}
 
 	time.Sleep(3 * time.Second)
 }

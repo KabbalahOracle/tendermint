@@ -107,13 +107,12 @@ func (r *Router) acceptPeers(transport Transport) {
 
 		conn, err := transport.Accept(context.Background())
 		switch err {
-		case ErrTransportClosed{}:
-			return
-		case io.EOF:
+		case ErrTransportClosed{}, io.EOF:
+			r.logger.Info("transport closed, stopping accept routine", "transport", transport)
 			return
 		case nil:
 		default:
-			r.logger.Error("failed to accept connection", "err", err)
+			r.logger.Error("failed to accept connection", "transport", transport, "err", err)
 			return
 		}
 
@@ -130,11 +129,20 @@ func (r *Router) acceptPeers(transport Transport) {
 			continue
 		}
 
+		r.mtx.Lock()
+		r.peers[peerID.String()] = conn
+		r.mtx.Unlock()
+
 		r.wgPeers.Add(1)
 		go func() {
-			defer r.wgPeers.Done()
-			defer r.store.Return(peer.ID)
-			defer conn.Close()
+			defer func() {
+				r.mtx.Lock()
+				delete(r.peers, peer.ID.String())
+				r.mtx.Unlock()
+				_ = conn.Close()
+				r.store.Return(peer.ID)
+				r.wgPeers.Done()
+			}()
 			err = r.receivePeer(peer, conn)
 			if err == io.EOF || err == nil {
 				r.logger.Info("peer disconnected", "peer", peer.ID)
@@ -164,14 +172,28 @@ func (r *Router) dialPeers() {
 
 		r.wgPeers.Add(1)
 		go func() {
-			defer r.wgPeers.Done()
-			defer r.store.Return(peer.ID)
-			conn, err := r.dialPeer(peer)
+			var (
+				conn Connection
+				err  error
+			)
+			defer func() {
+				if conn != nil {
+					_ = conn.Close()
+				}
+				r.mtx.Lock()
+				delete(r.peers, peer.ID.String())
+				r.mtx.Unlock()
+				r.store.Return(peer.ID)
+				r.wgPeers.Done()
+			}()
+			conn, err = r.dialPeer(peer)
 			if err != nil {
 				r.logger.Error("failed to dial peer, will retry", "peer", peer.ID)
 				return
 			}
-			defer conn.Close()
+			r.mtx.Lock()
+			r.peers[peer.ID.String()] = conn
+			r.mtx.Unlock()
 			err = r.receivePeer(peer, conn)
 			if err != nil {
 				r.logger.Error("peer failure", "peer", peer.ID, "err", err)
@@ -286,6 +308,7 @@ func (r *Router) receiveChannel(channel *Channel) {
 				_ = conn.Close()
 				continue
 			}
+			r.logger.Debug("sent message", "peer", envelope.To, "message", envelope.Message)
 		case <-channel.doneCh:
 			return
 		case <-r.chClose:
@@ -306,5 +329,5 @@ func (r *Router) OnStart() error {
 // OnStop implements service.Service.
 func (r *Router) OnStop() {
 	close(r.chClose)
-	r.wgPeers.Wait()
+	//r.wgPeers.Wait()
 }
