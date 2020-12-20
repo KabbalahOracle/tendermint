@@ -71,6 +71,4 @@ func TestRouter(t *testing.T) {
 			Message: &TestMessage{Value: "hi!"},
 		}, <-channel.In())
 	}
-
-	time.Sleep(3 * time.Second)
 }

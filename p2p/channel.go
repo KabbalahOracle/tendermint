@@ -15,6 +15,7 @@ type Envelope struct {
 	To        PeerID        // Message receiver, or empty for inbound messages.
 	Broadcast bool          // Send message to all connected peers, ignoring To.
 	Message   proto.Message // Payload.
+	channel   ChannelID
 }
 
 // Channel is a bidirectional channel for Protobuf message exchange with peers.

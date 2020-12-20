@@ -29,7 +29,7 @@ type Router struct {
 	// FIXME: consider using sync.Map for channels and peers.
 	mtx         sync.RWMutex
 	channels    map[ChannelID]*Channel
-	peers       map[string]Connection
+	peers       map[string]chan Envelope
 	peerUpdates map[*PeerUpdatesCh]*PeerUpdatesCh // keyed by struct identity (address)
 }
 
@@ -47,7 +47,7 @@ func NewRouter(logger log.Logger, transports map[Protocol]Transport, peers []Pee
 		store:       store,
 		chClose:     make(chan struct{}),
 		channels:    map[ChannelID]*Channel{},
-		peers:       map[string]Connection{},
+		peers:       map[string]chan Envelope{},
 		peerUpdates: map[*PeerUpdatesCh]*PeerUpdatesCh{},
 	}
 	router.BaseService = service.NewBaseService(logger, "router", router)
@@ -129,20 +129,24 @@ func (r *Router) acceptPeers(transport Transport) {
 			continue
 		}
 
+		r.wgPeers.Add(1)
+		ch := make(chan Envelope)
 		r.mtx.Lock()
-		r.peers[peerID.String()] = conn
+		r.peers[peerID.String()] = ch
 		r.mtx.Unlock()
 
-		r.wgPeers.Add(1)
 		go func() {
 			defer func() {
 				r.mtx.Lock()
 				delete(r.peers, peer.ID.String())
 				r.mtx.Unlock()
+				close(ch)
 				_ = conn.Close()
 				r.store.Return(peer.ID)
 				r.wgPeers.Done()
 			}()
+
+			go r.sendPeer(conn, ch)
 			err = r.receivePeer(peer, conn)
 			if err == io.EOF || err == nil {
 				r.logger.Info("peer disconnected", "peer", peer.ID)
@@ -172,30 +176,32 @@ func (r *Router) dialPeers() {
 
 		r.wgPeers.Add(1)
 		go func() {
-			var (
-				conn Connection
-				err  error
-			)
 			defer func() {
-				if conn != nil {
-					_ = conn.Close()
-				}
-				r.mtx.Lock()
-				delete(r.peers, peer.ID.String())
-				r.mtx.Unlock()
 				r.store.Return(peer.ID)
 				r.wgPeers.Done()
 			}()
-			conn, err = r.dialPeer(peer)
+
+			conn, err := r.dialPeer(peer)
 			if err != nil {
 				r.logger.Error("failed to dial peer, will retry", "peer", peer.ID)
 				return
 			}
+			defer conn.Close()
+
+			ch := make(chan Envelope)
 			r.mtx.Lock()
-			r.peers[peer.ID.String()] = conn
+			r.peers[peer.ID.String()] = ch
 			r.mtx.Unlock()
+			defer func() {
+				r.mtx.Lock()
+				delete(r.peers, peer.ID.String())
+				r.mtx.Unlock()
+			}()
+			go r.sendPeer(conn, ch)
 			err = r.receivePeer(peer, conn)
-			if err != nil {
+			if err == io.EOF || err == nil {
+				r.logger.Info("peer disconnected", "peer", peer.ID)
+			} else if err != nil {
 				r.logger.Error("peer failure", "peer", peer.ID, "err", err)
 			}
 		}()
@@ -277,6 +283,24 @@ func (r *Router) receivePeer(peer *sPeer, conn Connection) error {
 	}
 }
 
+// sendPeer receives outbound messages from channels and sends them to the peer.
+func (r *Router) sendPeer(conn Connection, ch <-chan Envelope) {
+	for envelope := range ch {
+		bz, err := proto.Marshal(envelope.Message)
+		if err != nil {
+			r.logger.Error("failed to marshal message", "peer", envelope.To.String(), "err", err)
+			continue
+		}
+
+		// FIXME: Should take ChannelID.
+		_, err = conn.SendMessage(byte(envelope.channel), bz)
+		if err != nil {
+			r.logger.Error("failed to send to peer", "peer", envelope.To.String(), "err", err)
+			continue
+		}
+	}
+}
+
 // receiveChannel receives outbound messages from a channel and sends them to the
 // appropriate peer.
 func (r *Router) receiveChannel(channel *Channel) {
@@ -287,27 +311,16 @@ func (r *Router) receiveChannel(channel *Channel) {
 				return
 			}
 			r.mtx.Lock()
-			conn, ok := r.peers[envelope.To.String()]
+			ch, ok := r.peers[envelope.To.String()]
 			r.mtx.Unlock()
+
 			if !ok {
 				r.logger.Error("dropping message for non-connected peer", "peer", envelope.To.String())
 				continue
 			}
 
-			bz, err := proto.Marshal(envelope.Message)
-			if err != nil {
-				r.logger.Error("failed to marshal message", "peer", envelope.To.String(), "err", err)
-				continue
-			}
-
-			// FIXME: We need a sender goroutine per peer.
-			// FIXME: Should take ChannelID.
-			_, err = conn.SendMessage(byte(channel.id), bz)
-			if err != nil {
-				r.logger.Error("failed to send to peer", "peer", envelope.To.String(), "err", err)
-				_ = conn.Close()
-				continue
-			}
+			envelope.channel = channel.id
+			ch <- envelope
 			r.logger.Debug("sent message", "peer", envelope.To, "message", envelope.Message)
 		case <-channel.doneCh:
 			return
